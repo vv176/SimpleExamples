@@ -101,7 +101,6 @@ class OpenAIClientWithMemoryAndTools:
             )
             #print(response)
             response_message = response.choices[0].message
-            
             # Check if the model wants to call a tool
             if response_message.tool_calls:
                 # Handle tool calls
