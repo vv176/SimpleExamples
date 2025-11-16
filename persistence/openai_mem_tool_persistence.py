@@ -55,7 +55,7 @@ class OpenAIClientWithMemoryAndToolsPersistence:
             city_enc = quote(city.strip())
             url = f"https://wttr.in/{city_enc}?format=j1&m&lang=en"
             
-            response = requests.get(url, timeout=6)
+            response = requests.get(url, timeout=15)
             response.raise_for_status()
             data = response.json()
             
@@ -81,16 +81,71 @@ class OpenAIClientWithMemoryAndToolsPersistence:
         try:
             db_history = self.db.get_conversation_history()
             messages = []
+            i = 0
             
-            for entry in db_history:
+            while i < len(db_history):
+                entry = db_history[i]
                 role = entry['role']
                 content = entry['response']
                 
-                if role in ['user', 'assistant']:
+                # Check if this is an assistant message with tool_calls (stored as JSON)
+                if role == 'assistant':
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, dict) and 'tool_calls' in parsed:
+                            # Reconstruct assistant message with tool_calls in proper format
+                            tool_calls_list = []
+                            for tc in parsed.get("tool_calls", []):
+                                # Convert to API format
+                                tool_calls_list.append({
+                                    "id": tc.get("id"),
+                                    "type": "function",  # Default type
+                                    "function": {
+                                        "name": tc.get("function_name"),
+                                        "arguments": tc.get("arguments")
+                                    }
+                                })
+                            
+                            assistant_msg = {
+                                "role": "assistant",
+                                "content": parsed.get("content", ""),
+                                "tool_calls": tool_calls_list
+                            }
+                            messages.append(assistant_msg)
+                            
+                            # Check if next entry is a tool message (tool results)
+                            if i + 1 < len(db_history) and db_history[i + 1]['role'] == 'tool':
+                                i += 1  # Move to next entry
+                                tool_entry = db_history[i]
+                                tool_content = tool_entry['response']
+                                
+                                try:
+                                    tool_parsed = json.loads(tool_content)
+                                    if isinstance(tool_parsed, dict) and "tool_results" in tool_parsed:
+                                        # Convert each tool result to proper tool message format
+                                        for tool_result in tool_parsed.get("tool_results", []):
+                                            tool_msg = {
+                                                "role": "tool",
+                                                "tool_call_id": tool_result.get("tool_call_id"),
+                                                "content": tool_result.get("content", "")
+                                            }
+                                            messages.append(tool_msg)
+                                except (json.JSONDecodeError, KeyError):
+                                    # If parsing fails, skip this tool message
+                                    pass
+                            
+                            i += 1
+                            continue
+                    except (json.JSONDecodeError, KeyError):
+                        # Not JSON or doesn't have tool_calls, treat as normal message
+                        pass
+                
+                # Regular message (user, assistant without tool_calls, system)
+                # Skip tool messages that were already processed above
+                if role != 'tool':
                     messages.append({"role": role, "content": content})
-                elif role == 'tool':
-                    # Convert tool results to assistant messages for context
-                    messages.append({"role": "assistant", "content": f"Tool result: {content}"})
+                
+                i += 1
             
             return messages
         except Exception as e:
@@ -175,13 +230,31 @@ class OpenAIClientWithMemoryAndToolsPersistence:
                         "content": result["content"]
                     })
                 
-                # Store grouped tool calls as single database entry
-                grouped_tool_calls = " | ".join(tool_call_descriptions)
-                self.db.insert_conversation("assistant", grouped_tool_calls)
+                # Store assistant message with tool_calls (serialize each tool call with id, function name, and args)
+                tool_calls_data = {
+                    "content": response_message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "function_name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                        for tc in all_tool_calls
+                    ]
+                }
+                self.db.insert_conversation("assistant", json.dumps(tool_calls_data))
                 
-                # Store grouped tool results as single database entry
-                grouped_tool_results = " | ".join(tool_result_descriptions)
-                self.db.insert_conversation("tool", grouped_tool_results)
+                # Store tool results (serialize with tool_call_id, function name, and content)
+                tool_results_data = {
+                    "tool_results": [
+                        {
+                            "tool_call_id": result["tool_call_id"],
+                            "content": result["content"]
+                        }
+                        for result in tool_results
+                    ]
+                }
+                self.db.insert_conversation("tool", json.dumps(tool_results_data))
                 
                 # Get final response from OpenAI
                 final_response = self.client.chat.completions.create(
@@ -287,13 +360,52 @@ class OpenAIClientWithMemoryAndToolsPersistence:
             print("-" * 50)
             for i, entry in enumerate(history, 1):
                 role_emoji = "👤" if entry["role"] == "user" else "🤖"
+                content = entry['response']
+                
                 if entry["role"] == "tool":
                     role_emoji = "🔧"
+                    # Try to parse as JSON to display tool results
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, dict) and "tool_results" in parsed:
+                            tool_results = parsed["tool_results"]
+                            result_contents = []
+                            for result in tool_results:
+                                tool_call_id = result.get("tool_call_id", "unknown")
+                                result_content = result.get("content", "")
+                                result_contents.append(f"[ID: {tool_call_id[:20]}... Result: {result_content}]")
+                            content = " | ".join(result_contents)
+                        else:
+                            content = f"[Tool Result: {content}]"
+                    except (json.JSONDecodeError, KeyError):
+                        content = f"[Tool Result: {content}]"
+                elif entry["role"] == "assistant":
+                    # Check if this is an assistant message with tool_calls (stored as JSON)
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, dict) and "tool_calls" in parsed:
+                            tool_calls = parsed["tool_calls"]
+                            tool_info = []
+                            for tool_call in tool_calls:
+                                tool_id = tool_call.get("id", "unknown")
+                                func_name = tool_call.get("function_name", "unknown")
+                                func_args = tool_call.get("arguments", "{}")
+                                tool_info.append(f"🔧 ID: {tool_id[:20]}... | {func_name}({func_args})")
+                            
+                            base_content = parsed.get("content", "")
+                            if base_content:
+                                content = f"{base_content} {' | '.join(tool_info)}"
+                            else:
+                                content = " | ".join(tool_info)
+                    except (json.JSONDecodeError, KeyError):
+                        # Not JSON or doesn't have tool_calls, display as normal message
+                        pass
                 elif entry["role"] == "system":
                     role_emoji = "⚙️"
                 
                 timestamp = entry["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
-                print(f"{i}. {role_emoji} {entry['role'].title()} ({timestamp}): {entry['response'][:100]}{'...' if len(entry['response']) > 100 else ''}")
+                display_content = content[:100] + ('...' if len(content) > 100 else '')
+                print(f"{i}. {role_emoji} {entry['role'].title()} ({timestamp}): {display_content}")
             print("-" * 50)
         except Exception as e:
             print(f"❌ Error loading conversation history: {e}")
